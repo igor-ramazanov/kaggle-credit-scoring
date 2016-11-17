@@ -2,3 +2,5 @@
 /.idea
 /spark-warehouse
 /project/target
+/res/**/*.csv
+/res/**/all*
