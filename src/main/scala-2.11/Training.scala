@@ -1,8 +1,8 @@
 import java.nio.file.{Files, Paths}
 
 import org.apache.spark.ml.classification.DecisionTreeClassifier
-import org.apache.spark.ml.evaluation.BinaryClassificationEvaluator
 import org.apache.spark.ml.linalg.{DenseVector, SparseVector}
+import org.apache.spark.mllib.evaluation.BinaryClassificationMetrics
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.{DataFrame, Row, SparkSession}
 
@@ -13,60 +13,79 @@ object Training {
   def main(args: Array[String]): Unit = {
     val sparkSession = createSparkSession
 
-    val data = readData(sparkSession, "cs-training")
-
+    val data = readData(sparkSession, "cs-training.csv")
     data.cache()
-    data.createOrReplaceTempView("data")
-
     val (training, testing) = getTrainingAndTesting(sparkSession, data)
 
-    val evaluator = new BinaryClassificationEvaluator
-
     val aucs = mutable.MutableList[Double]()
+    val precisions = mutable.MutableList[Double]()
+    val accuracies = mutable.MutableList[Double]()
+    val depthsRange = 6 to 6
 
-    for (maxDepth <- 2 to 30) {
+    for (maxDepth <- depthsRange) {
       val decisionTreeClassifier = createDTClassifier(maxDepth)
       val model = decisionTreeClassifier.fit(training)
       val predictions = model.transform(testing)
 
-      val auc = evaluator.evaluate(predictions)
+      val scoreAndLabels = getScoreAndLabels(predictions)
 
-      aucs += auc
+      val metric = new BinaryClassificationMetrics(scoreAndLabels, 100)
+      aucs += metric.areaUnderROC()
+      val roc = metric.roc().collect()
+      val rocCsv = "FPR,TPR" +: roc.map(p => s"${p._1},${p._2}")
 
-      val labels2Probabilities = getLabels2Probabilities(predictions)
-      val csv = convert2Csv(labels2Probabilities)
+      write(rocCsv, s"res/metrics/roc/roc_$maxDepth.csv")
 
-      write(csv, s"result_$maxDepth.csv")
+      val precision = metric.precisionByThreshold().collect().map(_._2).max
+      precisions += precision
+
+      val totalCount = predictions.count()
+
+      val accuracy = (0 to 100).map(i => i.toDouble / 100.0).map(i => {
+        val rightPredictedCount = scoreAndLabels.map {
+          case (score, label) => (math.signum(score - i).toInt + 1, label.toInt)
+        }.collect().count(p => p._2 == p._1)
+
+        rightPredictedCount.toDouble / totalCount.toDouble
+      }).max
+
+      accuracies += accuracy
+
+      val predictionResult = convert2Csv(scoreAndLabels)
+
+      write(predictionResult, s"res/predictions/prediction_$maxDepth.csv")
     }
 
-    writeAucs2File(aucs)
+    val convertToText: LinearSeq[_] => Array[String] = {
+      seq => seq.zip(depthsRange).map {
+        case (elem, i) => s"$i -> $elem"
+      }.toArray
+    }
+
+    val aucsAsText = convertToText(aucs)
+    val precisionsAsText = convertToText(precisions)
+    val accuraciesAsText = convertToText(accuracies)
+
+    write(aucsAsText, "res/metrics/auc/all-aucs")
+    write(precisionsAsText, "res/metrics/precision/all-precisions")
+    write(accuraciesAsText, "res/metrics/accuracy/all-accuracies")
   }
 
-  def write(csv: Array[String], fileName: String) = {
-    Files.write(Paths.get("res", "result", fileName), csv.toList)
-  }
-
-  def convert2Csv(labels2Probabilities: RDD[(Int, Double)]): Array[String] = {
-    "Label,Probability" +: labels2Probabilities.collect().map(p => s"${p._1},${p._2}")
-  }
-
-  def getLabels2Probabilities(predictions: DataFrame): RDD[(Int, Double)] = {
-    for (row <- predictions.rdd)
-      yield (row.getAs[Double]("label").toInt, row.getAs[DenseVector]("probability")(1))
-  }
-
-  def createDTClassifier(maxDepth: Int): DecisionTreeClassifier = {
-    new DecisionTreeClassifier()
-      .setLabelCol("label")
-      .setFeaturesCol("features")
-      .setMaxDepth(maxDepth)
-      .setMaxBins(32)
+  def createSparkSession: SparkSession = {
+    SparkSession.builder().appName("digits-recognition").master("local[4]").getOrCreate()
   }
 
   def readData(sparkSession: SparkSession, fileName: String): DataFrame = {
     import sparkSession.sqlContext.implicits._
     sparkSession.sqlContext.read.csv(fileName)
       .rdd.map(extractFeatures).toDF("index", "label", "features")
+  }
+
+  def convert2Double(input: String): Double = {
+    if (input.equalsIgnoreCase("NA"))
+      0.0
+    else
+      input.toDouble
   }
 
   def extractFeatures(row: Row): (Int, Double, SparseVector) = {
@@ -77,22 +96,8 @@ object Training {
     (index, label, new SparseVector(10, (0 until 10).toArray, features.toArray))
   }
 
-  def convert2Double(input: String): Double = {
-    if (input.equalsIgnoreCase("NA"))
-      0.0
-    else
-      input.toDouble
-  }
-
-  def createSparkSession: SparkSession = {
-    SparkSession.builder().appName("digits-recognition").master("local[4]").getOrCreate()
-  }
-
   def getTrainingAndTesting(sparkSession: SparkSession, data: DataFrame): (DataFrame, DataFrame) = {
-    val totalCount = data.count()
-    val threshold = totalCount.toDouble * 0.7
-    val training = sparkSession.sql(s"SELECT * from data WHERE index <= $threshold")
-    val testing = sparkSession.sql(s"SELECT * from data WHERE index > $threshold")
+    val Array(training, testing) = data.randomSplit(Array(0.6, 0.4))
 
     training.cache()
     testing.cache()
@@ -100,9 +105,27 @@ object Training {
     (training, testing)
   }
 
-  def writeAucs2File(aucs: LinearSeq[Double]): Any = {
-    Files.write(Paths.get("res", "auc", "by-spark", "all-aucs"), aucs.zipWithIndex.map {
-      case (auc, i) => s"$i -> $auc"
-    })
+  def createDTClassifier(maxDepth: Int): DecisionTreeClassifier = {
+    new DecisionTreeClassifier()
+      .setLabelCol("label")
+      .setFeaturesCol("features")
+      .setMaxDepth(maxDepth)
+      .setMaxBins(1024)
+  }
+
+  def getScoreAndLabels(predictions: DataFrame): RDD[(Double, Double)] = {
+    for (row <- predictions.rdd)
+      yield (row.getAs[DenseVector]("probability")(1), row.getAs[Double]("label"))
+  }
+
+  def convert2Csv(scoreAndLabels: RDD[(Double, Double)]): Array[String] = {
+    "Label,Probability" +: scoreAndLabels.collect().map {
+      case (score, label) => s"$label,$score"
+    }
+  }
+
+  def write(csv: Array[String], filePath: String) = {
+    val path = filePath.split('/')
+    Files.write(Paths.get(path.head, path.tail: _*), csv.toList)
   }
 }
