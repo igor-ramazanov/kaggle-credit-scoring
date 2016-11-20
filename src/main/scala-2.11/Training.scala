@@ -26,33 +26,19 @@ object Training {
       val decisionTreeClassifier = createDTClassifier(maxDepth)
       val model = decisionTreeClassifier.fit(training)
       val predictions = model.transform(testing)
-
       val scoreAndLabels = getScoreAndLabels(predictions)
 
-      val metric = new BinaryClassificationMetrics(scoreAndLabels, 100)
-      aucs += metric.areaUnderROC()
-      val roc = metric.roc().collect()
-      val rocCsv = "FPR,TPR" +: roc.map(p => s"${p._1},${p._2}")
+      val thresholdBinaries = 100
+      val metric = new BinaryClassificationMetrics(scoreAndLabels, thresholdBinaries)
 
-      write(rocCsv, s"res/metrics/roc/roc_$maxDepth.csv")
+      val roc = getRoc(metric)
+      writeRocCsv(maxDepth, roc)
 
-      val precision = metric.precisionByThreshold().collect().map(_._2).max
-      precisions += precision
-
-      val totalCount = predictions.count()
-
-      val accuracy = (0 to 100).map(i => i.toDouble / 100.0).map(i => {
-        val rightPredictedCount = scoreAndLabels.map {
-          case (score, label) => (math.signum(score - i).toInt + 1, label.toInt)
-        }.collect().count(p => p._2 == p._1)
-
-        rightPredictedCount.toDouble / totalCount.toDouble
-      }).max
-
-      accuracies += accuracy
+      aucs += getAuc(metric)
+      precisions += getPrecision(metric)
+      accuracies += getAccuracy(thresholdBinaries, scoreAndLabels)
 
       val predictionResult = convert2Csv(scoreAndLabels)
-
       write(predictionResult, s"res/predictions/prediction_$maxDepth.csv")
     }
 
@@ -116,6 +102,34 @@ object Training {
   def getScoreAndLabels(predictions: DataFrame): RDD[(Double, Double)] = {
     for (row <- predictions.rdd)
       yield (row.getAs[DenseVector]("probability")(1), row.getAs[Double]("label"))
+  }
+
+  def getRoc(metric: BinaryClassificationMetrics): Array[(Double, Double)] = {
+    metric.roc().collect()
+  }
+
+  def writeRocCsv(maxDepth: Int, roc: Array[(Double, Double)]): Unit = {
+    val rocCsv = "FPR,TPR" +: roc.map(p => s"${p._1},${p._2}")
+    write(rocCsv, s"res/metrics/roc/roc_$maxDepth.csv")
+  }
+
+  def getPrecision(metric: BinaryClassificationMetrics): Double = {
+    metric.precisionByThreshold().collect().map(_._2).max
+  }
+
+  def getAuc(metric: BinaryClassificationMetrics): Double = {
+    metric.areaUnderROC()
+  }
+
+  def getAccuracy(thresholdBinaries: Int, scoreAndLabels: RDD[(Double, Double)]): Double = {
+    val totalCount = scoreAndLabels.count()
+    (0 to thresholdBinaries).map(i => i.toDouble / thresholdBinaries.toDouble).map(i => {
+      val rightPredictedCount = scoreAndLabels.map {
+        case (score, label) => (math.signum(score - i).toInt + 1, label.toInt)
+      }.collect().count(p => p._2 == p._1)
+
+      rightPredictedCount.toDouble / totalCount.toDouble
+    }).max
   }
 
   def convert2Csv(scoreAndLabels: RDD[(Double, Double)]): Array[String] = {
